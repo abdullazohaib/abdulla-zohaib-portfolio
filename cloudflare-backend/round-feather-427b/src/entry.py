@@ -83,7 +83,6 @@ capabilities.
 For contact questions, direct the user to the Contact section.
 """
 
-
 app = FastAPI(
     title="Abdulla Zohaib Portfolio AI Assistant",
     version="1.0.0",
@@ -145,13 +144,6 @@ async def chat(request: Request, body: ChatRequest):
             detail="Message cannot be empty.",
         )
 
-    prompt = f"""
-{PORTFOLIO_CONTEXT}
-
-USER QUESTION:
-{message}
-"""
-
     url = (
         "https://generativelanguage.googleapis.com/"
         f"v1beta/models/{MODEL}:generateContent"
@@ -176,7 +168,6 @@ USER QUESTION:
             }
         ],
         "generationConfig": {
-            "temperature": 0.2,
             "maxOutputTokens": 600,
         },
     }
@@ -197,7 +188,7 @@ USER QUESTION:
                 error_data = response.json()
             except Exception:
                 error_data = {
-                    "message": response.text[:500]
+                    "message": response.text[:500],
                 }
 
             detail = error_data.get("error", {}).get(
