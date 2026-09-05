@@ -1,5 +1,4 @@
 import json
-import os
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -83,11 +82,14 @@ capabilities.
 For contact questions, direct the user to the Contact section.
 """
 
+
 app = FastAPI(
     title="Abdulla Zohaib Portfolio AI Assistant",
     version="1.0.0",
 )
 
+
+# Allow the portfolio frontend to call this API.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -112,12 +114,21 @@ async def root():
     return {
         "status": "ok",
         "service": "Abdulla Zohaib Portfolio AI Assistant",
+        "model": MODEL,
     }
 
 
 @app.get("/health")
 async def health(request: Request):
-    api_key = request.scope["env"].GEMINI_API_KEY
+    try:
+        api_key = request.scope["env"].GEMINI_API_KEY
+    except Exception as exc:
+        return {
+            "status": "ok",
+            "gemini_configured": False,
+            "model": MODEL,
+            "error": f"Could not access GEMINI_API_KEY: {type(exc).__name__}: {exc}",
+        }
 
     return {
         "status": "ok",
@@ -128,14 +139,30 @@ async def health(request: Request):
 
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(request: Request, body: ChatRequest):
-    api_key = request.scope["env"].GEMINI_API_KEY
+
+    # ---------------------------------------------------------
+    # 1. Read Gemini API key
+    # ---------------------------------------------------------
+    try:
+        api_key = request.scope["env"].GEMINI_API_KEY
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Could not access GEMINI_API_KEY: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        )
 
     if not api_key:
         raise HTTPException(
             status_code=500,
-            detail="Gemini API key is not configured.",
+            detail="GEMINI_API_KEY is missing.",
         )
 
+    # ---------------------------------------------------------
+    # 2. Validate user message
+    # ---------------------------------------------------------
     message = body.message.strip()
 
     if not message:
@@ -144,11 +171,17 @@ async def chat(request: Request, body: ChatRequest):
             detail="Message cannot be empty.",
         )
 
+    # ---------------------------------------------------------
+    # 3. Gemini endpoint
+    # ---------------------------------------------------------
     url = (
         "https://generativelanguage.googleapis.com/"
         f"v1beta/models/{MODEL}:generateContent"
     )
 
+    # ---------------------------------------------------------
+    # 4. Gemini request body
+    # ---------------------------------------------------------
     payload = {
         "system_instruction": {
             "parts": [
@@ -172,6 +205,9 @@ async def chat(request: Request, body: ChatRequest):
         },
     }
 
+    # ---------------------------------------------------------
+    # 5. Call Gemini
+    # ---------------------------------------------------------
     try:
         async with httpx.AsyncClient(timeout=45.0) as client:
             response = await client.post(
@@ -180,70 +216,141 @@ async def chat(request: Request, body: ChatRequest):
                     "x-goog-api-key": api_key,
                     "Content-Type": "application/json",
                 },
-                content=json.dumps(payload),
+                json=payload,
             )
-
-        if response.status_code >= 400:
-            try:
-                error_data = response.json()
-            except Exception:
-                error_data = {
-                    "message": response.text[:500],
-                }
-
-            detail = error_data.get("error", {}).get(
-                "message",
-                "Gemini request failed.",
-            )
-
-            raise HTTPException(
-                status_code=response.status_code,
-                detail=detail,
-            )
-
-        data = response.json()
-
-        candidates = data.get("candidates", [])
-
-        if not candidates:
-            raise HTTPException(
-                status_code=502,
-                detail="Gemini returned no answer.",
-            )
-
-        parts = (
-            candidates[0]
-            .get("content", {})
-            .get("parts", [])
-        )
-
-        answer_parts = [
-            part.get("text", "")
-            for part in parts
-            if part.get("text")
-        ]
-
-        answer = "\n".join(answer_parts).strip()
-
-        if not answer:
-            raise HTTPException(
-                status_code=502,
-                detail="Gemini returned an empty response.",
-            )
-
-        return ChatResponse(
-            response=answer,
-            interaction_id=None,
-        )
-
-    except HTTPException:
-        raise
 
     except Exception as exc:
         raise HTTPException(
             status_code=500,
-            detail=f"Gemini request failed: {exc}",
+            detail=(
+                "Backend Gemini request exception: "
+                f"{type(exc).__name__}: {exc}"
+            ),
         )
 
+    # ---------------------------------------------------------
+    # 6. Handle Gemini HTTP errors
+    #
+    # IMPORTANT:
+    # We return the real Gemini error here instead of
+    # hiding it behind "Request failed".
+    # ---------------------------------------------------------
+    if response.status_code >= 400:
 
+        try:
+            error_data = response.json()
+        except Exception:
+            error_data = None
+
+        if isinstance(error_data, dict):
+
+            gemini_error = error_data.get("error", {})
+
+            error_message = gemini_error.get(
+                "message",
+                "Gemini returned an error.",
+            )
+
+            error_status = gemini_error.get(
+                "status",
+                "UNKNOWN",
+            )
+
+            error_code = gemini_error.get(
+                "code",
+                response.status_code,
+            )
+
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=(
+                    f"Gemini HTTP {error_code} "
+                    f"({error_status}): {error_message}"
+                ),
+            )
+
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=(
+                f"Gemini HTTP {response.status_code}: "
+                f"{response.text[:1500]}"
+            ),
+        )
+
+    # ---------------------------------------------------------
+    # 7. Parse Gemini JSON
+    # ---------------------------------------------------------
+    try:
+        data = response.json()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Gemini returned invalid JSON: "
+                f"{type(exc).__name__}: {exc}. "
+                f"Body: {response.text[:1500]}"
+            ),
+        )
+
+    # ---------------------------------------------------------
+    # 8. Get candidates
+    # ---------------------------------------------------------
+    candidates = data.get("candidates", [])
+
+    if not candidates:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Gemini returned no candidates. "
+                f"Response: {json.dumps(data)[:2000]}"
+            ),
+        )
+
+    candidate = candidates[0]
+
+    # ---------------------------------------------------------
+    # 9. Extract response text
+    # ---------------------------------------------------------
+    content = candidate.get("content", {})
+    parts = content.get("parts", [])
+
+    answer_parts = []
+
+    for part in parts:
+        if isinstance(part, dict):
+            text = part.get("text")
+
+            if text:
+                answer_parts.append(text)
+
+    answer = "\n".join(answer_parts).strip()
+
+    # ---------------------------------------------------------
+    # 10. Handle empty Gemini response
+    # ---------------------------------------------------------
+    if not answer:
+        finish_reason = candidate.get(
+            "finishReason",
+            "UNKNOWN",
+        )
+
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Gemini returned no text. "
+                f"finishReason={finish_reason}. "
+                f"Response: {json.dumps(data)[:2000]}"
+            ),
+        )
+
+    # ---------------------------------------------------------
+    # 11. Successful response
+    # ---------------------------------------------------------
+    return ChatResponse(
+        response=answer,
+        interaction_id=None,
+    )
+
+
+# Cloudflare Workers ASGI entrypoint
 Default = asgi.entrypoint(app)
