@@ -1,13 +1,14 @@
 import json
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from workers import asgi
+from workers import asgi, env
 
 
 MODEL = "gemini-3.6-flash"
+
 
 PORTFOLIO_CONTEXT = """
 You are the AI Project Assistant for Abdulla Zohaib's personal portfolio.
@@ -89,7 +90,6 @@ app = FastAPI(
 )
 
 
-# Allow the portfolio frontend to call this API.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -109,6 +109,10 @@ class ChatResponse(BaseModel):
     interaction_id: str | None = None
 
 
+def get_gemini_api_key():
+    return getattr(env, "GEMINI_API_KEY", None)
+
+
 @app.get("/")
 async def root():
     return {
@@ -119,16 +123,8 @@ async def root():
 
 
 @app.get("/health")
-async def health(request: Request):
-    try:
-        api_key = request.scope["env"].GEMINI_API_KEY
-    except Exception as exc:
-        return {
-            "status": "ok",
-            "gemini_configured": False,
-            "model": MODEL,
-            "error": f"Could not access GEMINI_API_KEY: {type(exc).__name__}: {exc}",
-        }
+async def health():
+    api_key = get_gemini_api_key()
 
     return {
         "status": "ok",
@@ -138,30 +134,21 @@ async def health(request: Request):
 
 
 @app.post("/api/chat", response_model=ChatResponse)
-async def chat(request: Request, body: ChatRequest):
+async def chat(body: ChatRequest):
 
     # ---------------------------------------------------------
-    # 1. Read Gemini API key
+    # Get the Cloudflare Worker secret
     # ---------------------------------------------------------
-    try:
-        api_key = request.scope["env"].GEMINI_API_KEY
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "Could not access GEMINI_API_KEY: "
-                f"{type(exc).__name__}: {exc}"
-            ),
-        )
+    api_key = get_gemini_api_key()
 
     if not api_key:
         raise HTTPException(
             status_code=500,
-            detail="GEMINI_API_KEY is missing.",
+            detail="GEMINI_API_KEY is not configured in this Worker.",
         )
 
     # ---------------------------------------------------------
-    # 2. Validate user message
+    # Validate message
     # ---------------------------------------------------------
     message = body.message.strip()
 
@@ -172,7 +159,7 @@ async def chat(request: Request, body: ChatRequest):
         )
 
     # ---------------------------------------------------------
-    # 3. Gemini endpoint
+    # Gemini endpoint
     # ---------------------------------------------------------
     url = (
         "https://generativelanguage.googleapis.com/"
@@ -180,7 +167,7 @@ async def chat(request: Request, body: ChatRequest):
     )
 
     # ---------------------------------------------------------
-    # 4. Gemini request body
+    # Gemini payload
     # ---------------------------------------------------------
     payload = {
         "system_instruction": {
@@ -206,7 +193,7 @@ async def chat(request: Request, body: ChatRequest):
     }
 
     # ---------------------------------------------------------
-    # 5. Call Gemini
+    # Call Gemini
     # ---------------------------------------------------------
     try:
         async with httpx.AsyncClient(timeout=45.0) as client:
@@ -223,17 +210,13 @@ async def chat(request: Request, body: ChatRequest):
         raise HTTPException(
             status_code=500,
             detail=(
-                "Backend Gemini request exception: "
+                "Gemini request failed before receiving a response: "
                 f"{type(exc).__name__}: {exc}"
             ),
         )
 
     # ---------------------------------------------------------
-    # 6. Handle Gemini HTTP errors
-    #
-    # IMPORTANT:
-    # We return the real Gemini error here instead of
-    # hiding it behind "Request failed".
+    # Gemini HTTP errors
     # ---------------------------------------------------------
     if response.status_code >= 400:
 
@@ -243,7 +226,6 @@ async def chat(request: Request, body: ChatRequest):
             error_data = None
 
         if isinstance(error_data, dict):
-
             gemini_error = error_data.get("error", {})
 
             error_message = gemini_error.get(
@@ -278,7 +260,7 @@ async def chat(request: Request, body: ChatRequest):
         )
 
     # ---------------------------------------------------------
-    # 7. Parse Gemini JSON
+    # Parse Gemini response
     # ---------------------------------------------------------
     try:
         data = response.json()
@@ -287,13 +269,12 @@ async def chat(request: Request, body: ChatRequest):
             status_code=502,
             detail=(
                 "Gemini returned invalid JSON: "
-                f"{type(exc).__name__}: {exc}. "
-                f"Body: {response.text[:1500]}"
+                f"{type(exc).__name__}: {exc}"
             ),
         )
 
     # ---------------------------------------------------------
-    # 8. Get candidates
+    # Candidates
     # ---------------------------------------------------------
     candidates = data.get("candidates", [])
 
@@ -309,7 +290,7 @@ async def chat(request: Request, body: ChatRequest):
     candidate = candidates[0]
 
     # ---------------------------------------------------------
-    # 9. Extract response text
+    # Extract text
     # ---------------------------------------------------------
     content = candidate.get("content", {})
     parts = content.get("parts", [])
@@ -326,7 +307,7 @@ async def chat(request: Request, body: ChatRequest):
     answer = "\n".join(answer_parts).strip()
 
     # ---------------------------------------------------------
-    # 10. Handle empty Gemini response
+    # Empty response
     # ---------------------------------------------------------
     if not answer:
         finish_reason = candidate.get(
@@ -344,7 +325,7 @@ async def chat(request: Request, body: ChatRequest):
         )
 
     # ---------------------------------------------------------
-    # 11. Successful response
+    # Success
     # ---------------------------------------------------------
     return ChatResponse(
         response=answer,
